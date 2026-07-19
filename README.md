@@ -5,10 +5,11 @@ A lightweight Python desktop assistant with a futuristic JARVIS-style interface,
 ## Implementation plan
 
 1. **GUI shell and animations**: PySide6 renders a dark holographic dashboard, animated 2D AI core, waveform visualization, system panels, and non-blocking startup messages.
-2. **AI brain**: `ai/groq.py` calls the Groq OpenAI-compatible chat completions API with a JARVIS personality prompt and bounded conversation memory from `ai/memory.py`.
+2. **AI brain**: `ai/groq.py` calls Groq as the only AI provider, streams tokens as they arrive, and uses bounded conversation memory from `ai/memory.py`.
 3. **Voice**: `voice/listener.py` optionally listens for the configured wake word, and `voice/speaker.py` speaks responses without blocking the GUI.
-4. **System controls**: `system/commands.py` handles safe built-in actions such as time/date, system status, opening websites, and launching explicit apps.
-5. **Polish/performance**: Animations are timer-based 2D painting, avoiding heavy 3D rendering for Celeron-class Chromebooks.
+4. **System controls**: `system/commands.py` handles explicit local commands with intent matching so incidental words like "battery" or "system" do not accidentally execute actions.
+5. **Terminal assistant**: `services/terminal.py` creates confirm-first plans for common local terminal tasks and executes only after approval.
+6. **Polish/performance**: Animations are timer-based 2D painting, avoiding heavy 3D rendering for Celeron-class Chromebooks.
 
 ## Setup
 
@@ -78,8 +79,23 @@ Set `JARVIS_SUPPRESS_AUDIO_ERRORS=0` only when you need low-level audio debuggin
 
 ## Useful commands
 
-- `what time is it`
-- `show system usage`
+Commands are intentionally short and explicit. Full sentences that merely mention these words are treated as conversation and go to Groq instead.
+
+- `time` or `what time is it`
+- `date`
+- `battery` or `battery status`
+- `system`, `cpu`, `ram`, or `disk`
+- `wifi`, `network`, or `ip`
 - `open website example.com`
 - `open app xterm`
 - `clear memory`
+
+## Terminal assistant
+
+Terminal requests are generated as a visible command plan first. JARVIS waits for the **Execute** button or a typed approval such as `yes` before running anything, and destructive/system-changing plans are labelled. Current local-first plans include:
+
+- `Install ffmpeg`
+- `Update packages`
+- `Find every Python file`
+- `Search this folder for config`
+- `Kill Python`

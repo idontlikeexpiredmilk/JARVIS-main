@@ -19,11 +19,11 @@ from PySide6.QtWidgets import (
 
 from ai.groq import GroqClient
 from ai.memory import ConversationMemory
-from ai.provider import AIProvider
 from config import CONFIG
 from system.commands import CommandRouter
 from system.monitor import SystemMonitor
 from system.weather import WeatherService, WeatherSnapshot
+from services.terminal import TerminalPlan, TerminalService
 from ui.animations import StartupSequencer
 from ui.widgets import AICoreWidget, ChatView, HoloPanel, StatusPanel, WaveformWidget
 from voice.listener import VoiceListener
@@ -45,11 +45,12 @@ class WeatherWorker(QObject):
 
 
 class AIWorker(QObject):
-    """Runs blocking provider calls away from the GUI thread."""
+    """Streams Groq calls away from the GUI thread."""
 
+    chunk = Signal(str)
     finished = Signal(str)
 
-    def __init__(self, prompt: str, client: AIProvider, memory: ConversationMemory) -> None:
+    def __init__(self, prompt: str, client: GroqClient, memory: ConversationMemory) -> None:
         super().__init__()
         self.prompt = prompt
         self.client = client
@@ -57,7 +58,11 @@ class AIWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        self.finished.emit(self.client.generate(self.prompt, self.memory))
+        chunks: list[str] = []
+        for chunk in self.client.stream_generate(self.prompt, self.memory):
+            chunks.append(chunk)
+            self.chunk.emit(chunk)
+        self.finished.emit("".join(chunks))
 
 
 class VoiceBridge(QObject):
@@ -85,6 +90,8 @@ class MainWindow(QMainWindow):
         self.memory = ConversationMemory(max_turns=CONFIG.max_memory_turns)
         self.groq = GroqClient()
         self.commands = CommandRouter()
+        self.terminal = TerminalService()
+        self.pending_terminal_plan: TerminalPlan | None = None
         self.ai_thread: QThread | None = None
         self.weather_thread: QThread | None = None
         self.voice_bridge = VoiceBridge(self)
@@ -172,9 +179,17 @@ class MainWindow(QMainWindow):
         self.input.setPlaceholderText("Type a command or question...")
         self.send_button = QPushButton("Transmit")
         self.voice_button = QPushButton("Voice")
+        self.stop_button = QPushButton("Stop")
+        self.execute_button = QPushButton("Execute")
+        self.cancel_button = QPushButton("Cancel")
+        self.execute_button.hide()
+        self.cancel_button.hide()
         input_row.addWidget(self.input)
         input_row.addWidget(self.send_button)
         input_row.addWidget(self.voice_button)
+        input_row.addWidget(self.stop_button)
+        input_row.addWidget(self.execute_button)
+        input_row.addWidget(self.cancel_button)
         right.addWidget(self.chat)
         right.addLayout(input_row)
 
@@ -185,6 +200,9 @@ class MainWindow(QMainWindow):
         self.send_button.clicked.connect(self._submit_input)
         self.input.returnPressed.connect(self._submit_input)
         self.voice_button.clicked.connect(self.voice_listener.start)
+        self.stop_button.clicked.connect(self._stop_speaking)
+        self.execute_button.clicked.connect(self._execute_pending_terminal)
+        self.cancel_button.clicked.connect(self._cancel_pending_terminal)
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(
@@ -194,6 +212,7 @@ class MainWindow(QMainWindow):
             QTextEdit, QLineEdit { background: rgba(18, 14, 10, 210); border: 1px solid #cc6f10; border-radius: 8px; padding: 10px; color: #fdf3e6; }
             QPushButton { background: #241408; border: 1px solid #ff8c1a; border-radius: 8px; padding: 10px 16px; color: #ffd8a8; }
             QPushButton:hover { background: #3a2410; }
+            QPushButton:pressed { background: #ff8c1a; color: #08070a; }
             #HoloPanel { border: 1px solid #cc6f10; border-radius: 10px; background: rgba(20, 14, 8, 170); margin: 5px; }
             #PanelTitle { color: #ff9d3d; font-size: 12px; letter-spacing: 2px; }
             #PanelValue { color: #ffffff; font-size: 24px; font-weight: 600; }
@@ -228,6 +247,12 @@ class MainWindow(QMainWindow):
         if not prompt:
             return
         self.chat.add_message("USER", prompt, "user")
+        if self.pending_terminal_plan and prompt.lower() in {"yes", "y", "approve", "execute", "run it"}:
+            self._execute_pending_terminal()
+            return
+        if self.pending_terminal_plan and prompt.lower() in {"no", "n", "cancel", "stop"}:
+            self._cancel_pending_terminal()
+            return
         if prompt.lower() in {"clear memory", "reset conversation"}:
             self.memory.clear()
             self._respond("Conversation memory cleared.")
@@ -235,6 +260,10 @@ class MainWindow(QMainWindow):
         command = self.commands.handle(prompt)
         if command.handled:
             self._respond(command.message)
+            return
+        terminal_plan = self.terminal.build_plan(prompt)
+        if terminal_plan is not None:
+            self._show_terminal_plan(terminal_plan)
             return
         self.set_status("Consulting Groq AI core...")
         self.core.set_state("thinking")
@@ -246,17 +275,65 @@ class MainWindow(QMainWindow):
         worker = self.ai_worker
         worker.moveToThread(self.ai_thread)
         self.ai_thread.started.connect(worker.run)
-        worker.finished.connect(self._respond)
+        self.chat.begin_stream()
+        worker.chunk.connect(self._append_ai_chunk)
+        worker.finished.connect(self._finish_ai_stream)
         worker.finished.connect(self.ai_thread.quit)
         worker.finished.connect(worker.deleteLater)
         self.ai_thread.finished.connect(self.ai_thread.deleteLater)
         self.ai_thread.start()
 
     @Slot(str)
+    def _append_ai_chunk(self, text: str) -> None:
+        self.chat.append_stream(text)
+
+    @Slot(str)
+    def _finish_ai_stream(self, text: str) -> None:
+        self.chat.end_stream()
+        self.set_status("Systems online.")
+        self.speaker.speak(text)
+
+    @Slot(str)
     def _respond(self, text: str) -> None:
         self.chat.add_message("JARVIS", text, "assistant")
         self.set_status("Systems online.")
         self.speaker.speak(text)
+
+    @Slot()
+    def _stop_speaking(self) -> None:
+        self.speaker.stop()
+        self.set_status("Speech stopped. Generation can continue.")
+
+    def _show_terminal_plan(self, plan: TerminalPlan) -> None:
+        self.pending_terminal_plan = plan
+        risk = " Destructive/system-changing command." if plan.destructive else ""
+        self.chat.add_message(
+            "JARVIS",
+            f"Terminal plan: {plan.summary}\nCommand: {plan.display}\n{risk} Approve before I execute.",
+            "system",
+        )
+        self.execute_button.show()
+        self.cancel_button.show()
+        self.set_status("Awaiting terminal approval.")
+
+    @Slot()
+    def _execute_pending_terminal(self) -> None:
+        if self.pending_terminal_plan is None:
+            return
+        plan = self.pending_terminal_plan
+        self.pending_terminal_plan = None
+        self.execute_button.hide()
+        self.cancel_button.hide()
+        self.set_status("Executing approved local command...")
+        result = self.terminal.execute(plan)
+        self._respond(f"Command exited with code {result.returncode}.\n{result.output}")
+
+    @Slot()
+    def _cancel_pending_terminal(self) -> None:
+        self.pending_terminal_plan = None
+        self.execute_button.hide()
+        self.cancel_button.hide()
+        self._respond("Terminal command cancelled.")
 
     @Slot(str)
     def set_status(self, text: str) -> None:
