@@ -4,11 +4,13 @@ A lightweight Python desktop assistant with a futuristic JARVIS-style interface,
 
 ## Implementation plan
 
-1. **GUI shell and animations**: PySide6 renders a dark holographic dashboard, animated 2D AI core, waveform visualization, system panels, and non-blocking startup messages.
-2. **AI brain**: `ai/groq.py` calls the Groq OpenAI-compatible chat completions API with a JARVIS personality prompt and bounded conversation memory from `ai/memory.py`.
+1. **GUI shell and animations**: PySide6 renders a modern desktop assistant with wrapped chat bubbles, lightweight themed backgrounds, an animated 2D AI core, waveform visualization, system panels, and non-blocking startup messages.
+2. **AI brain**: `ai/groq.py` calls Groq as the only AI provider, streams tokens as they arrive, and uses bounded conversation memory from `ai/memory.py`.
 3. **Voice**: `voice/listener.py` optionally listens for the configured wake word, and `voice/speaker.py` speaks responses without blocking the GUI.
-4. **System controls**: `system/commands.py` handles safe built-in actions such as time/date, system status, opening websites, and launching explicit apps.
-5. **Polish/performance**: Animations are timer-based 2D painting, avoiding heavy 3D rendering for Celeron-class Chromebooks.
+4. **System controls**: `system/commands.py` handles explicit local commands with intent matching so incidental words like "battery" or "system" do not accidentally execute actions.
+5. **Terminal assistant**: `services/terminal.py` creates confirm-first plans for common local terminal tasks and executes only after approval.
+6. **Settings**: `services/settings.py` persists local appearance, background, font, transparency, TTS, speech speed, and startup preferences.
+7. **Polish/performance**: Animations are timer-based 2D painting, avoiding heavy 3D rendering for Celeron-class Chromebooks.
 
 ## Setup
 
@@ -78,8 +80,29 @@ Set `JARVIS_SUPPRESS_AUDIO_ERRORS=0` only when you need low-level audio debuggin
 
 ## Useful commands
 
-- `what time is it`
-- `show system usage`
+Commands are intentionally short and explicit. Full sentences that merely mention these words are treated as conversation and go to Groq instead.
+
+- `time` or `what time is it`
+- `date`
+- `battery` or `battery status`
+- `system`, `cpu`, `ram`, or `disk`
+- `wifi`, `network`, or `ip`
 - `open website example.com`
 - `open app xterm`
 - `clear memory`
+
+## Appearance settings
+
+Open **Settings** in the main window to adjust the accent color, theme color, built-in background, window transparency, chat bubble colors, font size, TTS voice label, speech speed, and startup voice-listener behavior. Settings are saved automatically to `~/.config/jarvis/settings.json` unless `JARVIS_SETTINGS_PATH` is set. On Wayland/Crostini, window opacity is not applied to the native top-level window because Qt only documents `windowOpacity` support for Embedded Linux, macOS, Windows, and X11 with compositing; theme and background colors still update immediately inside the app.
+
+Built-in low-cost backgrounds include Earth, Moon, Mars, Jupiter, Saturn, Neptune, Galaxy, Nebula, Black Hole, Stars, Aurora, Matrix, Circuit Board, and Abstract Waves. They are painted locally with simple Qt drawing primitives so switching is instant and Celeron-class systems stay responsive.
+
+## Terminal assistant
+
+Terminal requests are generated as a visible command plan first. JARVIS waits for the **Execute** button or a typed approval such as `yes` before running anything, and destructive/system-changing plans are labelled. Current local-first plans include:
+
+- `Install ffmpeg`
+- `Update packages`
+- `Find every Python file`
+- `Search this folder for config`
+- `Kill Python`

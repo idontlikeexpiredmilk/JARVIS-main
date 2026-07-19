@@ -4,30 +4,121 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import os
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QPushButton,
+    QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from ai.groq import GroqClient
 from ai.memory import ConversationMemory
-from ai.provider import AIProvider
 from config import CONFIG
 from system.commands import CommandRouter
 from system.monitor import SystemMonitor
 from system.weather import WeatherService, WeatherSnapshot
+from services.settings import AppearanceSettings, BUILT_IN_BACKGROUNDS, SettingsService
+from services.terminal import TerminalPlan, TerminalService
 from ui.animations import StartupSequencer
-from ui.widgets import AICoreWidget, ChatView, HoloPanel, StatusPanel, WaveformWidget
+from ui.widgets import AICoreWidget, BackgroundWidget, ChatView, HoloPanel, StatusPanel, WaveformWidget
 from voice.listener import VoiceListener
 from voice.speaker import Speaker
+
+
+class SettingsDialog(QDialog):
+    """Small auto-saving settings window for appearance and speech preferences."""
+
+    settings_changed = Signal(object)
+
+    def __init__(self, settings: AppearanceSettings, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("JARVIS Settings")
+        self.settings = settings
+        layout = QFormLayout(self)
+
+        self.background = QComboBox()
+        self.background.addItems(BUILT_IN_BACKGROUNDS)
+        self.background.setCurrentText(settings.background)
+        self.accent_button = QPushButton(settings.accent_color)
+        self.theme_button = QPushButton(settings.theme_color)
+        self.user_bubble_button = QPushButton(settings.user_bubble_color)
+        self.assistant_bubble_button = QPushButton(settings.assistant_bubble_color)
+        self.font_size = QSpinBox()
+        self.font_size.setRange(11, 24)
+        self.font_size.setValue(settings.font_size)
+        self.opacity = QSlider(Qt.Orientation.Horizontal)
+        self.opacity.setRange(55, 100)
+        self.opacity.setValue(settings.window_opacity)
+        self.tts_voice = QLineEdit(settings.tts_voice)
+        self.speech_speed = QSpinBox()
+        self.speech_speed.setRange(80, 260)
+        self.speech_speed.setValue(settings.speech_speed)
+        self.launch_voice = QCheckBox("Start voice listener on launch")
+        self.launch_voice.setChecked(settings.launch_voice_on_startup)
+
+        layout.addRow("Background", self.background)
+        layout.addRow("Accent color", self.accent_button)
+        layout.addRow("Theme color", self.theme_button)
+        layout.addRow("User bubble", self.user_bubble_button)
+        layout.addRow("Assistant bubble", self.assistant_bubble_button)
+        layout.addRow("Font size", self.font_size)
+        layout.addRow("Transparency", self.opacity)
+        layout.addRow("TTS voice", self.tts_voice)
+        layout.addRow("Speech speed", self.speech_speed)
+        layout.addRow("Startup", self.launch_voice)
+
+        self.background.currentTextChanged.connect(self._emit)
+        self.font_size.valueChanged.connect(self._emit)
+        self.opacity.valueChanged.connect(self._emit)
+        self.tts_voice.textChanged.connect(self._emit)
+        self.speech_speed.valueChanged.connect(self._emit)
+        self.launch_voice.toggled.connect(self._emit)
+        self.accent_button.clicked.connect(lambda: self._pick_color(self.accent_button))
+        self.theme_button.clicked.connect(lambda: self._pick_color(self.theme_button))
+        self.user_bubble_button.clicked.connect(lambda: self._pick_color(self.user_bubble_button))
+        self.assistant_bubble_button.clicked.connect(lambda: self._pick_color(self.assistant_bubble_button))
+        self._style_color_buttons()
+
+    def _pick_color(self, button: QPushButton) -> None:
+        color = QColorDialog.getColor(parent=self)
+        if color.isValid():
+            button.setText(color.name())
+            self._style_color_buttons()
+            self._emit()
+
+    def _style_color_buttons(self) -> None:
+        for button in (self.accent_button, self.theme_button, self.user_bubble_button, self.assistant_bubble_button):
+            button.setStyleSheet(f"background: {button.text()}; color: white; padding: 8px;")
+
+    def _emit(self, *args) -> None:
+        del args
+        self.settings = AppearanceSettings(
+            accent_color=self.accent_button.text(),
+            theme_color=self.theme_button.text(),
+            background=self.background.currentText(),
+            window_opacity=self.opacity.value(),
+            user_bubble_color=self.user_bubble_button.text(),
+            assistant_bubble_color=self.assistant_bubble_button.text(),
+            font_size=self.font_size.value(),
+            tts_voice=self.tts_voice.text() or "Default",
+            speech_speed=self.speech_speed.value(),
+            launch_voice_on_startup=self.launch_voice.isChecked(),
+        ).sanitized()
+        self.settings_changed.emit(self.settings)
 
 
 class WeatherWorker(QObject):
@@ -45,11 +136,12 @@ class WeatherWorker(QObject):
 
 
 class AIWorker(QObject):
-    """Runs blocking provider calls away from the GUI thread."""
+    """Streams Groq calls away from the GUI thread."""
 
+    chunk = Signal(str)
     finished = Signal(str)
 
-    def __init__(self, prompt: str, client: AIProvider, memory: ConversationMemory) -> None:
+    def __init__(self, prompt: str, client: GroqClient, memory: ConversationMemory) -> None:
         super().__init__()
         self.prompt = prompt
         self.client = client
@@ -57,7 +149,11 @@ class AIWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        self.finished.emit(self.client.generate(self.prompt, self.memory))
+        chunks: list[str] = []
+        for chunk in self.client.stream_generate(self.prompt, self.memory):
+            chunks.append(chunk)
+            self.chunk.emit(chunk)
+        self.finished.emit("".join(chunks))
 
 
 class VoiceBridge(QObject):
@@ -83,8 +179,14 @@ class MainWindow(QMainWindow):
         self.monitor = SystemMonitor()
         self.weather_service = WeatherService()
         self.memory = ConversationMemory(max_turns=CONFIG.max_memory_turns)
+        self.settings_service = SettingsService()
+        self.appearance = self.settings_service.load()
         self.groq = GroqClient()
         self.commands = CommandRouter()
+        self.terminal = TerminalService()
+        self.pending_terminal_plan: TerminalPlan | None = None
+        self._last_app_stylesheet = ""
+        self._last_window_opacity: float | None = None
         self.ai_thread: QThread | None = None
         self.weather_thread: QThread | None = None
         self.voice_bridge = VoiceBridge(self)
@@ -102,6 +204,8 @@ class MainWindow(QMainWindow):
         self._wire_timers()
         self._refresh_connection_status()
         self.startup = StartupSequencer(self.set_status)
+        if self.appearance.launch_voice_on_startup:
+            QTimer.singleShot(500, self.voice_listener.start)
         self.startup.start()
 
     def _size_to_screen(self) -> None:
@@ -126,9 +230,12 @@ class MainWindow(QMainWindow):
             self.resize(fallback_width, fallback_height)
 
     def _build_ui(self) -> None:
-        root = QWidget()
+        root = BackgroundWidget(self.appearance)
+        self.background = root
         self.setCentralWidget(root)
         main = QHBoxLayout(root)
+        main.setContentsMargins(16, 16, 16, 16)
+        main.setSpacing(16)
 
         left = QVBoxLayout()
         self.time_panel = HoloPanel("Time", "--:--")
@@ -166,15 +273,25 @@ class MainWindow(QMainWindow):
         center.addWidget(self.waveform)
 
         right = QVBoxLayout()
-        self.chat = ChatView()
+        self.chat = ChatView(self.appearance)
         input_row = QHBoxLayout()
         self.input = QLineEdit()
         self.input.setPlaceholderText("Type a command or question...")
         self.send_button = QPushButton("Transmit")
         self.voice_button = QPushButton("Voice")
+        self.stop_button = QPushButton("Stop Speaking")
+        self.settings_button = QPushButton("Settings")
+        self.execute_button = QPushButton("Execute")
+        self.cancel_button = QPushButton("Cancel")
+        self.execute_button.hide()
+        self.cancel_button.hide()
         input_row.addWidget(self.input)
         input_row.addWidget(self.send_button)
         input_row.addWidget(self.voice_button)
+        input_row.addWidget(self.stop_button)
+        input_row.addWidget(self.settings_button)
+        input_row.addWidget(self.execute_button)
+        input_row.addWidget(self.cancel_button)
         right.addWidget(self.chat)
         right.addLayout(input_row)
 
@@ -185,21 +302,58 @@ class MainWindow(QMainWindow):
         self.send_button.clicked.connect(self._submit_input)
         self.input.returnPressed.connect(self._submit_input)
         self.voice_button.clicked.connect(self.voice_listener.start)
+        self.stop_button.clicked.connect(self._stop_speaking)
+        self.settings_button.clicked.connect(self._open_settings)
+        self.execute_button.clicked.connect(self._execute_pending_terminal)
+        self.cancel_button.clicked.connect(self._cancel_pending_terminal)
 
     def _apply_theme(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget { background: #08070a; color: #f2e9df; font-family: 'DejaVu Sans'; }
-            #StatusLabel { color: #ff9d3d; font-size: 22px; letter-spacing: 2px; padding: 12px; }
-            QTextEdit, QLineEdit { background: rgba(18, 14, 10, 210); border: 1px solid #cc6f10; border-radius: 8px; padding: 10px; color: #fdf3e6; }
-            QPushButton { background: #241408; border: 1px solid #ff8c1a; border-radius: 8px; padding: 10px 16px; color: #ffd8a8; }
-            QPushButton:hover { background: #3a2410; }
-            #HoloPanel { border: 1px solid #cc6f10; border-radius: 10px; background: rgba(20, 14, 8, 170); margin: 5px; }
-            #PanelTitle { color: #ff9d3d; font-size: 12px; letter-spacing: 2px; }
-            #PanelValue { color: #ffffff; font-size: 24px; font-weight: 600; }
-            #PanelRow { color: #f0d3ae; font-size: 12px; padding-top: 2px; }
-            """
-        )
+        """Apply appearance settings without touching unsafe Wayland window state."""
+        settings = self.appearance
+        self._apply_safe_window_opacity(settings)
+        stylesheet = self._build_app_stylesheet(settings)
+        if stylesheet != self._last_app_stylesheet:
+            self.setStyleSheet(stylesheet)
+            self._last_app_stylesheet = stylesheet
+        self.chat.apply_settings(settings)
+        self.background.apply_settings(settings)
+
+    def _build_app_stylesheet(self, settings: AppearanceSettings) -> str:
+        """Return a targeted stylesheet instead of restyling every QWidget."""
+        return f"""
+            QMainWindow {{ background: {settings.theme_color}; color: #f2e9df; font-family: 'DejaVu Sans'; }}
+            QLabel {{ color: #f2e9df; font-family: 'DejaVu Sans'; }}
+            #StatusLabel {{ color: {settings.accent_color}; font-size: {settings.font_size + 7}px; letter-spacing: 2px; padding: 12px; }}
+            QLineEdit {{ background: rgba(18, 14, 10, 220); border: 1px solid {settings.accent_color}; border-radius: 10px; padding: 11px; color: #fdf3e6; font-size: {settings.font_size}px; }}
+            QPushButton {{ background: rgba(36, 20, 8, 220); border: 1px solid {settings.accent_color}; border-radius: 10px; padding: 10px 14px; color: #ffd8a8; }}
+            QPushButton:hover {{ background: rgba(58, 36, 16, 230); }}
+            QPushButton:pressed {{ background: {settings.accent_color}; color: #08070a; }}
+            #HoloPanel {{ border: 1px solid {settings.accent_color}; border-radius: 12px; background: rgba(20, 14, 8, 178); margin: 5px; }}
+            #PanelTitle {{ color: {settings.accent_color}; font-size: 12px; letter-spacing: 2px; background: transparent; }}
+            #PanelValue {{ color: #ffffff; font-size: 24px; font-weight: 600; background: transparent; }}
+            #PanelRow {{ color: #f0d3ae; font-size: 12px; padding-top: 2px; background: transparent; }}
+        """
+
+    def _apply_safe_window_opacity(self, settings: AppearanceSettings) -> None:
+        """Avoid QWindow opacity updates on Wayland/Crostini.
+
+        Qt's Wayland platform has historically reported that window opacity is
+        unsupported. On Crostini that unsupported native window update can tear
+        down the Wayland connection, so the transparency slider is treated as a
+        paint-only preference there. The background/chat widgets still apply the
+        rest of the appearance settings instantly.
+        """
+        if self._is_wayland_session():
+            return
+        opacity = settings.window_opacity / 100
+        if opacity != self._last_window_opacity:
+            self.setWindowOpacity(opacity)
+            self._last_window_opacity = opacity
+
+    @staticmethod
+    def _is_wayland_session() -> bool:
+        platform_name = QApplication.platformName().lower()
+        return "wayland" in platform_name or bool(os.getenv("WAYLAND_DISPLAY"))
 
     def _wire_timers(self) -> None:
         self.system_timer = QTimer(self)
@@ -228,6 +382,12 @@ class MainWindow(QMainWindow):
         if not prompt:
             return
         self.chat.add_message("USER", prompt, "user")
+        if self.pending_terminal_plan and prompt.lower() in {"yes", "y", "approve", "execute", "run it"}:
+            self._execute_pending_terminal()
+            return
+        if self.pending_terminal_plan and prompt.lower() in {"no", "n", "cancel", "stop"}:
+            self._cancel_pending_terminal()
+            return
         if prompt.lower() in {"clear memory", "reset conversation"}:
             self.memory.clear()
             self._respond("Conversation memory cleared.")
@@ -235,6 +395,10 @@ class MainWindow(QMainWindow):
         command = self.commands.handle(prompt)
         if command.handled:
             self._respond(command.message)
+            return
+        terminal_plan = self.terminal.build_plan(prompt)
+        if terminal_plan is not None:
+            self._show_terminal_plan(terminal_plan)
             return
         self.set_status("Consulting Groq AI core...")
         self.core.set_state("thinking")
@@ -246,17 +410,78 @@ class MainWindow(QMainWindow):
         worker = self.ai_worker
         worker.moveToThread(self.ai_thread)
         self.ai_thread.started.connect(worker.run)
-        worker.finished.connect(self._respond)
+        self.chat.begin_stream()
+        worker.chunk.connect(self._append_ai_chunk)
+        worker.finished.connect(self._finish_ai_stream)
         worker.finished.connect(self.ai_thread.quit)
         worker.finished.connect(worker.deleteLater)
         self.ai_thread.finished.connect(self.ai_thread.deleteLater)
         self.ai_thread.start()
 
     @Slot(str)
+    def _append_ai_chunk(self, text: str) -> None:
+        self.chat.append_stream(text)
+
+    @Slot(str)
+    def _finish_ai_stream(self, text: str) -> None:
+        self.chat.end_stream()
+        self.set_status("Systems online.")
+        self.speaker.speak(text)
+
+    @Slot(str)
     def _respond(self, text: str) -> None:
         self.chat.add_message("JARVIS", text, "assistant")
         self.set_status("Systems online.")
         self.speaker.speak(text)
+
+    @Slot()
+    def _stop_speaking(self) -> None:
+        self.speaker.stop()
+        self.set_status("Speech stopped. Groq generation continues.")
+
+    def _show_terminal_plan(self, plan: TerminalPlan) -> None:
+        self.pending_terminal_plan = plan
+        risk = " Destructive/system-changing command." if plan.destructive else ""
+        self.chat.add_message(
+            "JARVIS",
+            f"Terminal plan: {plan.summary}\nCommand: {plan.display}\n{risk} Approve before I execute.",
+            "system",
+        )
+        self.execute_button.show()
+        self.cancel_button.show()
+        self.set_status("Awaiting terminal approval.")
+
+    @Slot()
+    def _execute_pending_terminal(self) -> None:
+        if self.pending_terminal_plan is None:
+            return
+        plan = self.pending_terminal_plan
+        self.pending_terminal_plan = None
+        self.execute_button.hide()
+        self.cancel_button.hide()
+        self.set_status("Executing approved local command...")
+        result = self.terminal.execute(plan)
+        self._respond(f"Command exited with code {result.returncode}.\n{result.output}")
+
+    @Slot()
+    def _cancel_pending_terminal(self) -> None:
+        self.pending_terminal_plan = None
+        self.execute_button.hide()
+        self.cancel_button.hide()
+        self._respond("Terminal command cancelled.")
+
+    @Slot()
+    def _open_settings(self) -> None:
+        dialog = SettingsDialog(self.appearance, self)
+        dialog.settings_changed.connect(self._apply_settings_update)
+        dialog.show()
+        self.settings_dialog = dialog
+
+    @Slot(object)
+    def _apply_settings_update(self, settings: AppearanceSettings) -> None:
+        self.appearance = settings.sanitized()
+        self.settings_service.save(self.appearance)
+        self._apply_theme()
 
     @Slot(str)
     def set_status(self, text: str) -> None:

@@ -67,11 +67,22 @@ class Speaker:
         self._thread.start()
 
     def stop(self) -> None:
+        """Immediately interrupt current playback/synthesis and clear queued TTS."""
         self._stop_requested = True
         with self._lock:
             process = self._process
         if process is not None and process.poll() is None:
             process.terminate()
+        if self._pyttsx3_lock.acquire(blocking=False):
+            try:
+                engine = self._pyttsx3_engine
+                if engine is not None:
+                    try:
+                        engine.stop()
+                    except Exception:
+                        pass
+            finally:
+                self._pyttsx3_lock.release()
 
     def _speak_blocking(self, text: str) -> None:
         clean_text = text.strip()
