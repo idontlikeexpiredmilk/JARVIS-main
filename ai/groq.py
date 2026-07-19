@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from collections.abc import Iterator
 from typing import Any
 
 from ai.memory import ConversationMemory
@@ -47,29 +48,100 @@ class GroqClient:
 
     def generate(self, prompt: str, memory: ConversationMemory) -> str:
         """Send a prompt to Groq and return the first assistant message."""
+        return "".join(self.stream_generate(prompt, memory))
+
+    def stream_generate(self, prompt: str, memory: ConversationMemory) -> Iterator[str]:
+        """Yield a Groq response incrementally as text arrives."""
         if not self.configured:
-            return (
+            yield (
                 "Groq is not configured. Set GROQ_API_KEY in your environment, "
                 "then restart the assistant."
             )
+            return
 
         memory.add_user(prompt)
-        payload = self._build_payload(memory)
+        payload = self._build_payload(memory) | {"stream": True}
         self._debug(f"Groq endpoint: {GROQ_CHAT_COMPLETIONS_URL}")
         self._debug(f"Groq model: {self.model}")
 
         start = time.monotonic()
-        if importlib.util.find_spec("groq") is not None:
-            text = self._generate_with_official_client(payload)
-        else:
-            self._debug("Groq SDK not installed; using urllib fallback with explicit User-Agent.")
-            text = self._generate_with_urllib(payload)
-        response_time = time.monotonic() - start
-        print(f"[JARVIS AI] Response time: {response_time:.2f} seconds")
+        chunks: list[str] = []
+        try:
+            iterator = (
+                self._stream_with_official_client(payload)
+                if importlib.util.find_spec("groq") is not None
+                else self._stream_with_urllib(payload)
+            )
+            for chunk in iterator:
+                chunks.append(chunk)
+                yield chunk
+        finally:
+            response_time = time.monotonic() - start
+            print(f"[JARVIS AI] Response time: {response_time:.2f} seconds")
 
-        if not text.startswith("Groq HTTP error") and not text.startswith("Network error"):
+        text = "".join(chunks).strip()
+        if text and not text.startswith("Groq HTTP error") and not text.startswith("Network error"):
             memory.add_assistant(text)
-        return text
+
+
+    def _stream_with_official_client(self, payload: dict[str, object]) -> Iterator[str]:
+        """Stream tokens with Groq's official Python client when installed."""
+        groq_module = importlib.import_module("groq")
+        client = groq_module.Groq(api_key=self.api_key, timeout=self.timeout)
+        try:
+            stream = client.chat.completions.create(**payload)
+            for event in stream:
+                choices = getattr(event, "choices", [])
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                content = getattr(delta, "content", "") if delta is not None else ""
+                if content:
+                    yield str(content)
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", "unknown")
+            body = self._exception_body(exc)
+            self._debug(f"Groq HTTP status: {status_code}")
+            self._debug(f"Groq failure body: {body}")
+            yield f"Groq HTTP error {status_code}: {body}"
+
+    def _stream_with_urllib(self, payload: dict[str, object]) -> Iterator[str]:
+        """Stream server-sent events with the standard library fallback."""
+        request = urllib.request.Request(
+            GROQ_CHAT_COMPLETIONS_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=self._build_headers() | {"Accept": "text/event-stream"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                self._debug(f"Groq HTTP status: {response.status}")
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        payload_chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    text = self._extract_delta(payload_chunk)
+                    if text:
+                        yield text
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            self._debug(f"Groq HTTP status: {exc.code}")
+            self._debug(f"Groq failure body: {detail}")
+            yield f"Groq HTTP error {exc.code}: {detail[:800]}"
+        except urllib.error.URLError as exc:
+            self._debug("Groq HTTP status: unavailable")
+            self._debug(f"Groq failure body: {exc.reason}")
+            yield f"Network error while contacting Groq: {exc.reason}"
+        except TimeoutError:
+            self._debug("Groq HTTP status: timeout")
+            yield "Groq request timed out."
 
     def _generate_with_official_client(self, payload: dict[str, object]) -> str:
         """Send the request with Groq's official Python client when installed."""
@@ -144,6 +216,16 @@ class GroqClient:
             "Accept": "application/json",
             "User-Agent": GROQ_USER_AGENT,
         }
+
+    @staticmethod
+    def _extract_delta(data: dict[str, object]) -> str:
+        choices = data.get("choices", [])
+        if not isinstance(choices, list) or not choices:
+            return ""
+        choice = choices[0]
+        delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+        content = delta.get("content", "") if isinstance(delta, dict) else ""
+        return str(content)
 
     @staticmethod
     def _extract_text(data: dict[str, object]) -> str:
