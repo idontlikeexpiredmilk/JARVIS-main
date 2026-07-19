@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import os
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtWidgets import (
@@ -184,6 +185,8 @@ class MainWindow(QMainWindow):
         self.commands = CommandRouter()
         self.terminal = TerminalService()
         self.pending_terminal_plan: TerminalPlan | None = None
+        self._last_app_stylesheet = ""
+        self._last_window_opacity: float | None = None
         self.ai_thread: QThread | None = None
         self.weather_thread: QThread | None = None
         self.voice_bridge = VoiceBridge(self)
@@ -305,24 +308,52 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self._cancel_pending_terminal)
 
     def _apply_theme(self) -> None:
+        """Apply appearance settings without touching unsafe Wayland window state."""
         settings = self.appearance
-        self.setWindowOpacity(settings.window_opacity / 100)
-        self.setStyleSheet(
-            f"""
-            QMainWindow, QWidget {{ background: transparent; color: #f2e9df; font-family: 'DejaVu Sans'; }}
+        self._apply_safe_window_opacity(settings)
+        stylesheet = self._build_app_stylesheet(settings)
+        if stylesheet != self._last_app_stylesheet:
+            self.setStyleSheet(stylesheet)
+            self._last_app_stylesheet = stylesheet
+        self.chat.apply_settings(settings)
+        self.background.apply_settings(settings)
+
+    def _build_app_stylesheet(self, settings: AppearanceSettings) -> str:
+        """Return a targeted stylesheet instead of restyling every QWidget."""
+        return f"""
+            QMainWindow {{ background: {settings.theme_color}; color: #f2e9df; font-family: 'DejaVu Sans'; }}
+            QLabel {{ color: #f2e9df; font-family: 'DejaVu Sans'; }}
             #StatusLabel {{ color: {settings.accent_color}; font-size: {settings.font_size + 7}px; letter-spacing: 2px; padding: 12px; }}
             QLineEdit {{ background: rgba(18, 14, 10, 220); border: 1px solid {settings.accent_color}; border-radius: 10px; padding: 11px; color: #fdf3e6; font-size: {settings.font_size}px; }}
             QPushButton {{ background: rgba(36, 20, 8, 220); border: 1px solid {settings.accent_color}; border-radius: 10px; padding: 10px 14px; color: #ffd8a8; }}
             QPushButton:hover {{ background: rgba(58, 36, 16, 230); }}
             QPushButton:pressed {{ background: {settings.accent_color}; color: #08070a; }}
             #HoloPanel {{ border: 1px solid {settings.accent_color}; border-radius: 12px; background: rgba(20, 14, 8, 178); margin: 5px; }}
-            #PanelTitle {{ color: {settings.accent_color}; font-size: 12px; letter-spacing: 2px; }}
-            #PanelValue {{ color: #ffffff; font-size: 24px; font-weight: 600; }}
-            #PanelRow {{ color: #f0d3ae; font-size: 12px; padding-top: 2px; }}
-            """
-        )
-        self.chat.apply_settings(settings)
-        self.background.apply_settings(settings)
+            #PanelTitle {{ color: {settings.accent_color}; font-size: 12px; letter-spacing: 2px; background: transparent; }}
+            #PanelValue {{ color: #ffffff; font-size: 24px; font-weight: 600; background: transparent; }}
+            #PanelRow {{ color: #f0d3ae; font-size: 12px; padding-top: 2px; background: transparent; }}
+        """
+
+    def _apply_safe_window_opacity(self, settings: AppearanceSettings) -> None:
+        """Avoid QWindow opacity updates on Wayland/Crostini.
+
+        Qt's Wayland platform has historically reported that window opacity is
+        unsupported. On Crostini that unsupported native window update can tear
+        down the Wayland connection, so the transparency slider is treated as a
+        paint-only preference there. The background/chat widgets still apply the
+        rest of the appearance settings instantly.
+        """
+        if self._is_wayland_session():
+            return
+        opacity = settings.window_opacity / 100
+        if opacity != self._last_window_opacity:
+            self.setWindowOpacity(opacity)
+            self._last_window_opacity = opacity
+
+    @staticmethod
+    def _is_wayland_session() -> bool:
+        platform_name = QApplication.platformName().lower()
+        return "wayland" in platform_name or bool(os.getenv("WAYLAND_DISPLAY"))
 
     def _wire_timers(self) -> None:
         self.system_timer = QTimer(self)

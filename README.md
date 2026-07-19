@@ -93,7 +93,7 @@ Commands are intentionally short and explicit. Full sentences that merely mentio
 
 ## Appearance settings
 
-Open **Settings** in the main window to adjust the accent color, theme color, built-in background, window transparency, chat bubble colors, font size, TTS voice label, speech speed, and startup voice-listener behavior. Settings are saved automatically to `~/.config/jarvis/settings.json` unless `JARVIS_SETTINGS_PATH` is set.
+Open **Settings** in the main window to adjust the accent color, theme color, built-in background, window transparency, chat bubble colors, font size, TTS voice label, speech speed, and startup voice-listener behavior. Settings are saved automatically to `~/.config/jarvis/settings.json` unless `JARVIS_SETTINGS_PATH` is set. On Wayland/Crostini, window opacity is not applied to the native top-level window because Qt only documents `windowOpacity` support for Embedded Linux, macOS, Windows, and X11 with compositing; theme and background colors still update immediately inside the app.
 
 Built-in low-cost backgrounds include Earth, Moon, Mars, Jupiter, Saturn, Neptune, Galaxy, Nebula, Black Hole, Stars, Aurora, Matrix, Circuit Board, and Abstract Waves. They are painted locally with simple Qt drawing primitives so switching is instant and Celeron-class systems stay responsive.
 
