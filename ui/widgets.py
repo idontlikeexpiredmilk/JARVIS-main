@@ -5,11 +5,12 @@ from __future__ import annotations
 import math
 import random
 from datetime import datetime
-from html import escape
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QRadialGradient, QTextCursor
-from PySide6.QtWidgets import QFrame, QLabel, QTextEdit, QVBoxLayout, QWidget
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QRadialGradient
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+
+from services.settings import AppearanceSettings, BUILT_IN_BACKGROUNDS
 
 
 class HoloPanel(QFrame):
@@ -61,47 +62,271 @@ class StatusPanel(QFrame):
             row.setText(f"{key}: {value}")
 
 
-class ChatView(QTextEdit):
-    """Efficient holographic chat stream with timestamped message cards."""
+class MessageBubble(QFrame):
+    """Resizable modern chat bubble that preserves natural text spacing."""
 
-    def __init__(self) -> None:
+    def __init__(self, speaker: str, text: str, role: str, settings: AppearanceSettings) -> None:
         super().__init__()
-        self.setReadOnly(True)
-        self.setPlaceholderText("Conversation stream")
-        self.document().setDefaultStyleSheet(
-            """
-            body { color: #f2e9df; font-family: 'DejaVu Sans'; font-size: 15px; }
-            .row { margin: 12px 0; }
-            .label { font-size: 11px; letter-spacing: 1.5px; color: #ff9d3d; }
-            .time { color: #8a7c6c; font-size: 10px; }
-            .bubble { border-radius: 12px; padding: 10px 12px; line-height: 1.35; }
-            .user { background-color: rgba(46, 28, 12, 0.85); border: 1px solid #ff8c1a; color: #fff3e6; }
-            .assistant { background-color: rgba(18, 14, 10, 0.92); border: 1px solid #cc6f10; color: #fdf3e6; }
-            .system { background-color: rgba(40, 30, 15, 0.85); border: 1px solid #ffbf6b; color: #fff2d6; }
+        self.role = role
+        self._text = ""
+        self._settings = settings
+        self.setObjectName(f"Bubble_{role}")
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Minimum)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(7)
+
+        timestamp = datetime.now().strftime("%H:%M")
+        self.meta = QLabel(f"{speaker.upper()}  ·  {timestamp}")
+        self.meta.setObjectName("BubbleMeta")
+        self.meta.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.text = QLabel()
+        self.text.setObjectName("BubbleText")
+        self.text.setWordWrap(True)
+        self.text.setTextFormat(Qt.TextFormat.MarkdownText)
+        self.text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.text.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.text.setMinimumWidth(180)
+        layout.addWidget(self.meta)
+        layout.addWidget(self.text)
+        self.apply_settings(settings)
+        self.set_text(text)
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        # QLabel with MarkdownText preserves spaces/punctuation in normal text,
+        # wraps long paragraphs, and gives us a future path for lightweight
+        # markdown without the table-layout whitespace bugs QTextEdit had here.
+        self.text.setText(text if text else " ")
+        self.updateGeometry()
+
+    def append_text(self, text: str) -> None:
+        self.set_text(self._text + text)
+
+    def apply_settings(self, settings: AppearanceSettings) -> None:
+        self._settings = settings
+        color = {
+            "user": settings.user_bubble_color,
+            "assistant": settings.assistant_bubble_color,
+            "system": settings.system_bubble_color,
+        }.get(self.role, settings.assistant_bubble_color)
+        border = settings.accent_color if self.role != "user" else QColor(settings.accent_color).lighter(125).name()
+        self.setStyleSheet(
+            f"""
+            QFrame#Bubble_{self.role} {{
+                background: {color};
+                border: 1px solid {border};
+                border-radius: 18px;
+            }}
+            QLabel#BubbleMeta {{
+                color: {settings.accent_color};
+                font-size: {max(9, settings.font_size - 4)}px;
+                letter-spacing: 1px;
+                background: transparent;
+            }}
+            QLabel#BubbleText {{
+                color: #fff5ea;
+                font-size: {settings.font_size}px;
+                line-height: 145%;
+                background: transparent;
+            }}
             """
         )
 
+    def set_maximum_bubble_width(self, viewport_width: int) -> None:
+        self.setMaximumWidth(max(260, int(viewport_width * 0.72)))
+
+
+class ChatView(QScrollArea):
+    """Modern widget-based chat stream with reliable wrapping and spacing."""
+
+    def __init__(self, settings: AppearanceSettings | None = None) -> None:
+        super().__init__()
+        self.settings = settings or AppearanceSettings()
+        self._stream_bubble: MessageBubble | None = None
+        self._bubbles: list[MessageBubble] = []
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.viewport().setAutoFillBackground(False)
+
+        self.container = QWidget()
+        self.container.setObjectName("ChatContainer")
+        self.layout = QVBoxLayout(self.container)
+        self.layout.setContentsMargins(18, 18, 18, 18)
+        self.layout.setSpacing(14)
+        self.layout.addStretch(1)
+        self.setWidget(self.container)
+        self.apply_settings(self.settings)
+
     def add_message(self, speaker: str, text: str, role: str) -> None:
-        """Append a formatted message card and scroll to the newest entry."""
-        timestamp = datetime.now().strftime("%H:%M")
-        safe_speaker = escape(speaker.upper())
-        safe_text = escape(text).replace("\n", "<br>")
-        safe_role = escape(role)
-        alignment = "right" if role == "user" else "left"
-        html = f"""
-        <div class="row" align="{alignment}">
-          <table width="78%" cellspacing="0" cellpadding="0">
-            <tr><td><span class="label">{safe_speaker}</span> <span class="time">{timestamp}</span></td></tr>
-            <tr><td class="bubble {safe_role}">{safe_text}</td></tr>
-          </table>
-        </div>
-        """
-        cursor = self.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertHtml(html)
-        cursor.insertBlock()
-        self.setTextCursor(cursor)
-        self.ensureCursorVisible()
+        bubble = MessageBubble(speaker, text, role, self.settings)
+        self._insert_bubble(bubble, role)
+
+    def begin_stream(self, speaker: str = "JARVIS", role: str = "assistant") -> None:
+        self._stream_bubble = MessageBubble(speaker, "", role, self.settings)
+        self._insert_bubble(self._stream_bubble, role)
+
+    def append_stream(self, text: str) -> None:
+        if self._stream_bubble is None:
+            self.begin_stream()
+        assert self._stream_bubble is not None
+        self._stream_bubble.append_text(text)
+        self._scroll_to_bottom()
+
+    def end_stream(self) -> None:
+        self._stream_bubble = None
+        self._scroll_to_bottom()
+
+    def apply_settings(self, settings: AppearanceSettings) -> None:
+        self.settings = settings
+        self.setStyleSheet(
+            f"""
+            QScrollArea {{
+                background: rgba(8, 7, 10, 128);
+                border: 1px solid {settings.accent_color};
+                border-radius: 16px;
+            }}
+            QWidget#ChatContainer {{ background: transparent; }}
+            QScrollBar:vertical {{ background: rgba(255,255,255,24); width: 10px; border-radius: 5px; }}
+            QScrollBar::handle:vertical {{ background: {settings.accent_color}; border-radius: 5px; min-height: 24px; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            """
+        )
+        for bubble in self._bubbles:
+            bubble.apply_settings(settings)
+            bubble.set_maximum_bubble_width(self.viewport().width())
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        for bubble in self._bubbles:
+            bubble.set_maximum_bubble_width(self.viewport().width())
+
+    def _insert_bubble(self, bubble: MessageBubble, role: str) -> None:
+        bubble.set_maximum_bubble_width(self.viewport().width())
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        if role == "user":
+            row_layout.addStretch(1)
+            row_layout.addWidget(bubble)
+        else:
+            row_layout.addWidget(bubble)
+            row_layout.addStretch(1)
+        self.layout.insertWidget(max(0, self.layout.count() - 1), row)
+        self._bubbles.append(bubble)
+        self._scroll_to_bottom()
+
+    def _scroll_to_bottom(self) -> None:
+        QTimer.singleShot(0, lambda: self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
+
+
+class BackgroundWidget(QWidget):
+    """Low-cost themed background painter with optional slow animation."""
+
+    def __init__(self, settings: AppearanceSettings) -> None:
+        super().__init__()
+        self.settings = settings
+        self.phase = 0.0
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(120)
+
+    def apply_settings(self, settings: AppearanceSettings) -> None:
+        self.settings = settings
+        self.update()
+
+    def _tick(self) -> None:
+        if self.settings.background in {"Stars", "Aurora", "Matrix", "Abstract Waves", "Galaxy", "Nebula"}:
+            self.phase = (self.phase + 0.035) % math.tau
+            self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        rect = self.rect()
+        base = QColor(self.settings.theme_color)
+        painter.fillRect(rect, base)
+        name = self.settings.background
+        accent = QColor(self.settings.accent_color)
+
+        if name in {"Earth", "Moon", "Mars", "Jupiter", "Saturn", "Neptune"}:
+            self._paint_planet(painter, rect, name, accent)
+        elif name in {"Galaxy", "Nebula", "Stars", "Black Hole"}:
+            self._paint_space(painter, rect, name, accent)
+        elif name == "Aurora":
+            self._paint_aurora(painter, rect, accent)
+        elif name == "Matrix":
+            self._paint_matrix(painter, rect)
+        elif name == "Circuit Board":
+            self._paint_circuit(painter, rect, accent)
+        else:
+            self._paint_waves(painter, rect, accent)
+
+    def _paint_planet(self, painter: QPainter, rect: QRectF, name: str, accent: QColor) -> None:
+        colors = {
+            "Earth": QColor(38, 120, 170),
+            "Moon": QColor(145, 145, 135),
+            "Mars": QColor(175, 76, 42),
+            "Jupiter": QColor(196, 142, 92),
+            "Saturn": QColor(204, 158, 93),
+            "Neptune": QColor(52, 92, 190),
+        }
+        planet = colors.get(name, accent)
+        center = QPointF(rect.width() * 0.82, rect.height() * 0.2)
+        radius = max(rect.width(), rect.height()) * 0.22
+        gradient = QRadialGradient(center, radius)
+        gradient.setColorAt(0, planet.lighter(150))
+        gradient.setColorAt(1, QColor(planet.red() // 4, planet.green() // 4, planet.blue() // 4, 40))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(gradient)
+        painter.drawEllipse(center, radius, radius)
+        if name == "Saturn":
+            painter.setPen(QPen(QColor(230, 190, 120, 95), 3))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QRectF(center.x() - radius * 1.5, center.y() - radius * 0.35, radius * 3, radius * 0.7))
+
+    def _paint_space(self, painter: QPainter, rect: QRectF, name: str, accent: QColor) -> None:
+        painter.setPen(QPen(QColor(255, 255, 255, 70), 1))
+        step = 47 if name != "Stars" else 34
+        offset = int(self.phase * 10) % step
+        for x in range(offset, int(rect.width()), step):
+            for y in range((x * 7) % step, int(rect.height()), step * 2):
+                painter.drawPoint(x, y)
+        if name in {"Galaxy", "Nebula", "Black Hole"}:
+            painter.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 60), 2))
+            for i in range(4):
+                painter.drawArc(QRectF(rect.center().x() - 120 - i * 45, rect.center().y() - 45 - i * 20, 240 + i * 90, 90 + i * 40), 20 * 16, 220 * 16)
+
+    def _paint_aurora(self, painter: QPainter, rect: QRectF, accent: QColor) -> None:
+        painter.setPen(QPen(QColor(accent.red(), 220, 180, 75), 3))
+        for i in range(5):
+            y = rect.height() * (0.2 + i * 0.1)
+            path = QPainterPath(QPointF(0, y))
+            path.cubicTo(rect.width() * 0.3, y + math.sin(self.phase + i) * 60, rect.width() * 0.6, y - 60, rect.width(), y + 20)
+            painter.drawPath(path)
+
+    def _paint_matrix(self, painter: QPainter, rect: QRectF) -> None:
+        painter.setPen(QPen(QColor(65, 255, 120, 55), 1))
+        for x in range(0, int(rect.width()), 28):
+            painter.drawLine(x, 0, x, int(rect.height()))
+
+    def _paint_circuit(self, painter: QPainter, rect: QRectF, accent: QColor) -> None:
+        painter.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 75), 1))
+        for x in range(24, int(rect.width()), 72):
+            painter.drawLine(x, 0, x, int(rect.height()))
+            for y in range(30, int(rect.height()), 90):
+                painter.drawLine(x, y, min(int(rect.width()), x + 42), y)
+
+    def _paint_waves(self, painter: QPainter, rect: QRectF, accent: QColor) -> None:
+        painter.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 80), 2))
+        for i in range(7):
+            y = rect.height() * (0.15 + i * 0.12)
+            path = QPainterPath(QPointF(0, y))
+            path.cubicTo(rect.width() * 0.25, y + 40, rect.width() * 0.65, y - 40, rect.width(), y)
+            painter.drawPath(path)
+
 
     def begin_stream(self, speaker: str = "JARVIS", role: str = "assistant") -> None:
         """Start an assistant card that can receive streaming chunks."""
