@@ -103,6 +103,39 @@ class ChatView(QTextEdit):
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
 
+    def begin_stream(self, speaker: str = "JARVIS", role: str = "assistant") -> None:
+        """Start an assistant card that can receive streaming chunks."""
+        timestamp = datetime.now().strftime("%H:%M")
+        alignment = "right" if role == "user" else "left"
+        html = f"""
+        <div class="row" align="{alignment}">
+          <table width="78%" cellspacing="0" cellpadding="0">
+            <tr><td><span class="label">{escape(speaker.upper())}</span> <span class="time">{timestamp}</span></td></tr>
+            <tr><td class="bubble {escape(role)}">
+        """
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertHtml(html)
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
+
+    def append_stream(self, text: str) -> None:
+        """Append escaped text to the active streaming assistant card."""
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertHtml(escape(text).replace("\n", "<br>"))
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
+
+    def end_stream(self) -> None:
+        """Close the active streaming assistant card."""
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertHtml("</td></tr></table></div>")
+        cursor.insertBlock()
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
+
 
 #: Pulse speed (timer tick, ms) per AI state. Faster ticks for active states,
 #: slower/cheaper when idle. Color no longer switches per-state (the planet
